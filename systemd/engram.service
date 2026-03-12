@@ -1,0 +1,36 @@
+[Unit]
+Description=Engram Persistent Memory Service
+Documentation=https://github.com/Vicinious/engram
+After=network.target
+
+[Service]
+Type=simple
+User=engram
+Group=openclaw-bots
+WorkingDirectory=/srv/openclaw-shared/engram
+ExecStart=/opt/node/bin/node src/server.js
+Restart=always
+RestartSec=5
+
+# Environment
+Environment=NODE_ENV=production
+Environment=ENGRAM_PORT=18850
+Environment=ENGRAM_DB=/var/lib/engram/brain.db
+Environment=ENGRAM_LOG=/var/log/engram/engram.log
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/engram /var/run/engram /var/log/engram
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
