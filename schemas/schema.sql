@@ -48,21 +48,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     state TEXT DEFAULT 'active' CHECK(state IN ('active','compacted','ended'))
 );
 
--- Behavioral patterns
+-- Behavioral patterns (v0.3.0 - pattern learning)
 CREATE TABLE IF NOT EXISTS patterns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,  -- NULL = cross-agent
-    pattern_type TEXT NOT NULL,
-    description TEXT NOT NULL,
-    trigger_conditions TEXT,  -- JSON array of conditions
-    expected_behavior TEXT,
+    agent_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    pattern_json TEXT NOT NULL,
+    description TEXT,
     confidence REAL DEFAULT 0.5 CHECK(confidence BETWEEN 0.0 AND 1.0),
-    match_count INTEGER DEFAULT 0,
-    violation_count INTEGER DEFAULT 0,
-    last_matched DATETIME,
-    last_violated DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    is_active BOOLEAN DEFAULT 1
+    occurrence_count INTEGER DEFAULT 1,
+    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+    source TEXT DEFAULT 'learned',
+    is_active BOOLEAN DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Corrections (user feedback)
@@ -123,7 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sessions_agent_state ON sessions(agent_id, state);
 CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(last_activity DESC);
-CREATE INDEX IF NOT EXISTS idx_patterns_agent ON patterns(agent_id, pattern_type, is_active);
+CREATE INDEX IF NOT EXISTS idx_patterns_agent ON patterns(agent_id, type, is_active);
 CREATE INDEX IF NOT EXISTS idx_corrections_agent ON corrections(agent_id, is_active);
 CREATE INDEX IF NOT EXISTS idx_tool_usage_agent ON tool_usage(agent_id, last_used DESC);
 

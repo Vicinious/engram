@@ -3,6 +3,9 @@
  * Engram Server - Persistent Memory Service
  * 
  * Main daemon process that maintains agent memory state.
+ * v0.2.0 - Added semantic embeddings for vector search
+ * v0.3.0 - Added pattern learning and auto-corrections
+ * v0.4.0 - Added hive-mind cross-agent knowledge propagation
  */
 
 const express = require('express');
@@ -10,14 +13,25 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 
+// Embeddings service (lazy loaded)
+let embeddings = null;
+const getEmbeddings = () => {
+  if (!embeddings) {
+    embeddings = require('./services/embeddings');
+  }
+  return embeddings;
+};
+
 // Configuration
 const CONFIG = {
   port: parseInt(process.env.ENGRAM_PORT || '18850'),
   socketPath: process.env.ENGRAM_SOCKET || '/var/run/engram/engram.sock',
   dbPath: process.env.ENGRAM_DB || '/var/lib/engram/brain.db',
   logPath: process.env.ENGRAM_LOG || '/var/log/engram/engram.log',
-  maxInjectionTokens: 1500,  // Approximate token limit for context injection
-  maxInjectionBytes: 6000    // ~4 chars per token
+  maxInjectionTokens: 1500,
+  maxInjectionBytes: 6000,
+  dedupeThreshold: 0.85,  // Similarity threshold for deduplication
+  semanticSearchMinScore: 0.4  // Minimum score for semantic search results
 };
 
 // Ensure directories exist
@@ -43,6 +57,22 @@ const initDatabase = () => {
     db.exec(schema);
   }
   
+  // Migration: Add embedding column if not exists
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN embedding BLOB`);
+    console.log('[engram] Added embedding column');
+  } catch (e) {
+    // Column already exists
+  }
+  
+  // Migration: Add embedded flag
+  try {
+    db.exec(`ALTER TABLE memories ADD COLUMN is_embedded BOOLEAN DEFAULT 0`);
+    console.log('[engram] Added is_embedded column');
+  } catch (e) {
+    // Column already exists
+  }
+  
   console.log(`[engram] Database initialized: ${CONFIG.dbPath}`);
 };
 
@@ -52,23 +82,51 @@ app.use(express.json());
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '0.1.0' });
+  res.json({ status: 'ok', version: '0.4.0' });
 });
 
 // Status endpoint
 app.get('/api/v1/status', (req, res) => {
   const agents = db.prepare('SELECT COUNT(*) as count FROM agents WHERE is_active = 1').get();
   const memories = db.prepare('SELECT COUNT(*) as count FROM memories WHERE is_active = 1').get();
+  const embedded = db.prepare('SELECT COUNT(*) as count FROM memories WHERE is_embedded = 1').get();
   const sessions = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE state = ?').get('active');
   
+  // Pattern stats (may fail if tables don't exist yet)
+  let patternStats = { patterns: 0, unresolvedDeviations: 0, pendingAutoCorrections: 0 };
+  try {
+    const analyzer = getPatternAnalyzer();
+    patternStats = analyzer.getStats();
+  } catch (e) {
+    // Pattern tables may not exist yet
+  }
+  
+  // Hive stats (may fail if tables don't exist yet)
+  let hiveStats = { pendingPropagations: 0, hiveMemories: 0 };
+  try {
+    const hive = getHiveMind();
+    hiveStats = hive.getStats();
+  } catch (e) {
+    // Hive tables may not exist yet
+  }
+  
   res.json({
-    version: '0.1.0',
+    version: '0.4.0',
     status: 'running',
     agents: agents.count,
     memories: memories.count,
+    embeddedMemories: embedded.count,
     activeSessions: sessions.count,
+    patterns: patternStats.patterns,
+    pendingAutoCorrections: patternStats.pendingAutoCorrections,
+    unresolvedDeviations: patternStats.unresolvedDeviations,
+    pendingPropagations: hiveStats.pendingPropagations,
+    hiveMemories: hiveStats.hiveMemories,
     dbPath: CONFIG.dbPath,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    semanticSearch: true,
+    patternLearning: true,
+    hiveMind: true
   });
 });
 
@@ -165,6 +223,33 @@ app.post('/api/v1/wake', (req, res) => {
       injection += '\n';
     }
     
+    // Get recent hive knowledge
+    try {
+      const hive = getHiveMind();
+      const hiveKnowledge = db.prepare(`
+        SELECT content, json_extract(metadata_json, '$.source_agent') as source,
+               json_extract(metadata_json, '$.knowledge_type') as ktype
+        FROM memories 
+        WHERE agent_id = ? 
+          AND is_active = 1 
+          AND json_extract(metadata_json, '$.from_hive') = 1
+          AND created_at > datetime('now', '-7 days')
+        ORDER BY created_at DESC
+        LIMIT 5
+      `).all(agent);
+      
+      if (hiveKnowledge.length > 0) {
+        injection += `### 🐝 Recent Hive Knowledge\n`;
+        hiveKnowledge.forEach(h => {
+          const icon = h.ktype === 'correction' ? '🔴' : h.ktype === 'warning' ? '⚠️' : '💡';
+          injection += `${icon} ${h.content.replace(/^\[From \w+\]\s*/, '')} _(via ${h.source})_\n`;
+        });
+        injection += '\n';
+      }
+    } catch (e) {
+      // Hive not available yet
+    }
+    
     // Record injection
     const stmt = db.prepare(`
       INSERT INTO injections (agent_id, session_id, injection_content, memory_count, token_estimate)
@@ -184,19 +269,65 @@ app.post('/api/v1/wake', (req, res) => {
   }
 });
 
-// Remember endpoint - store a memory
-app.post('/api/v1/remember', (req, res) => {
-  const { agent, type, content, priority, metadata, tags, expires_in } = req.body;
+// Check for duplicates using semantic similarity
+async function findDuplicates(content, agentId, type) {
+  const emb = getEmbeddings();
+  
+  // Get recent memories of same type for this agent
+  const candidates = db.prepare(`
+    SELECT id, content, embedding
+    FROM memories
+    WHERE agent_id = ? AND type = ? AND is_active = 1 AND is_embedded = 1
+    ORDER BY created_at DESC
+    LIMIT 50
+  `).all(agentId, type);
+  
+  if (candidates.length === 0) return null;
+  
+  // Embed the new content
+  const queryVec = await emb.embed(content);
+  
+  // Check similarity against candidates
+  for (const cand of candidates) {
+    if (!cand.embedding) continue;
+    const candVec = emb.deserializeEmbedding(cand.embedding);
+    const similarity = emb.cosineSimilarity(queryVec, candVec);
+    
+    if (similarity >= CONFIG.dedupeThreshold) {
+      return { id: cand.id, content: cand.content, similarity };
+    }
+  }
+  
+  return null;
+}
+
+// Remember endpoint - store a memory with embedding
+app.post('/api/v1/remember', async (req, res) => {
+  const { agent, type, content, priority, metadata, tags, expires_in, skipDedupe } = req.body;
   
   if (!agent || !type || !content) {
     return res.status(400).json({ error: 'agent, type, and content are required' });
   }
   
   try {
-    const stmt = db.prepare(`
-      INSERT INTO memories (agent_id, type, content, priority, metadata_json, tags, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
+    // Check for duplicates (unless skipped)
+    if (!skipDedupe) {
+      const dupe = await findDuplicates(content, agent, type);
+      if (dupe) {
+        return res.json({
+          id: dupe.id,
+          stored: false,
+          deduplicated: true,
+          similarity: dupe.similarity.toFixed(3),
+          existingContent: dupe.content
+        });
+      }
+    }
+    
+    // Generate embedding
+    const emb = getEmbeddings();
+    const embedding = await emb.embed(content);
+    const embeddingBuffer = emb.serializeEmbedding(embedding);
     
     let expiresAt = null;
     if (expires_in) {
@@ -205,6 +336,11 @@ app.post('/api/v1/remember', (req, res) => {
       expiresAt = now.toISOString();
     }
     
+    const stmt = db.prepare(`
+      INSERT INTO memories (agent_id, type, content, priority, metadata_json, tags, expires_at, embedding, is_embedded)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+    `);
+    
     const result = stmt.run(
       agent,
       type,
@@ -212,10 +348,11 @@ app.post('/api/v1/remember', (req, res) => {
       priority || 5,
       metadata ? JSON.stringify(metadata) : null,
       tags ? JSON.stringify(tags) : null,
-      expiresAt
+      expiresAt,
+      embeddingBuffer
     );
     
-    res.json({ id: result.lastInsertRowid, stored: true });
+    res.json({ id: result.lastInsertRowid, stored: true, embedded: true });
     
   } catch (err) {
     console.error('[engram] Remember error:', err);
@@ -223,8 +360,8 @@ app.post('/api/v1/remember', (req, res) => {
   }
 });
 
-// Decide endpoint - record a decision
-app.post('/api/v1/decide', (req, res) => {
+// Decide endpoint - record a decision with embedding
+app.post('/api/v1/decide', async (req, res) => {
   const { agent, decision, reason, alternatives } = req.body;
   
   if (!agent || !decision) {
@@ -232,18 +369,35 @@ app.post('/api/v1/decide', (req, res) => {
   }
   
   try {
+    // Check for duplicate decisions
+    const dupe = await findDuplicates(decision, agent, 'decision');
+    if (dupe) {
+      return res.json({
+        id: dupe.id,
+        stored: false,
+        deduplicated: true,
+        similarity: dupe.similarity.toFixed(3)
+      });
+    }
+    
+    // Generate embedding
+    const emb = getEmbeddings();
+    const embedding = await emb.embed(decision);
+    const embeddingBuffer = emb.serializeEmbedding(embedding);
+    
     const stmt = db.prepare(`
-      INSERT INTO memories (agent_id, type, content, priority, metadata_json)
-      VALUES (?, 'decision', ?, 8, ?)
+      INSERT INTO memories (agent_id, type, content, priority, metadata_json, embedding, is_embedded)
+      VALUES (?, 'decision', ?, 8, ?, ?, 1)
     `);
     
     const result = stmt.run(
       agent,
       decision,
-      JSON.stringify({ reason, alternatives })
+      JSON.stringify({ reason, alternatives }),
+      embeddingBuffer
     );
     
-    res.json({ id: result.lastInsertRowid, stored: true });
+    res.json({ id: result.lastInsertRowid, stored: true, embedded: true });
     
   } catch (err) {
     console.error('[engram] Decide error:', err);
@@ -275,7 +429,7 @@ app.post('/api/v1/correct', (req, res) => {
   }
 });
 
-// Recall endpoint - search memories
+// Recall endpoint - FTS search (fallback)
 app.get('/api/v1/recall', (req, res) => {
   const { q, agent, type, limit } = req.query;
   
@@ -309,10 +463,118 @@ app.get('/api/v1/recall', (req, res) => {
     
     const results = db.prepare(sql).all(...params);
     
-    res.json({ results, count: results.length });
+    res.json({ results, count: results.length, searchType: 'fts' });
     
   } catch (err) {
     console.error('[engram] Recall error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Semantic search endpoint - vector similarity search
+app.get('/api/v1/search', async (req, res) => {
+  const { q, agent, type, limit, minScore } = req.query;
+  
+  if (!q) {
+    return res.status(400).json({ error: 'query (q) is required' });
+  }
+  
+  try {
+    const emb = getEmbeddings();
+    
+    // Get embedded memories
+    let sql = `
+      SELECT id, agent_id, type, content, priority, created_at, metadata_json, embedding
+      FROM memories
+      WHERE is_active = 1 AND is_embedded = 1
+    `;
+    const params = [];
+    
+    if (agent) {
+      sql += ' AND agent_id = ?';
+      params.push(agent);
+    }
+    
+    if (type) {
+      sql += ' AND type = ?';
+      params.push(type);
+    }
+    
+    const candidates = db.prepare(sql).all(...params);
+    
+    if (candidates.length === 0) {
+      return res.json({ results: [], count: 0, searchType: 'semantic' });
+    }
+    
+    // Embed query
+    const queryVec = await emb.embed(q);
+    
+    // Score all candidates
+    const scored = candidates
+      .map(m => ({
+        id: m.id,
+        agent_id: m.agent_id,
+        type: m.type,
+        content: m.content,
+        priority: m.priority,
+        created_at: m.created_at,
+        metadata_json: m.metadata_json,
+        score: emb.cosineSimilarity(queryVec, emb.deserializeEmbedding(m.embedding))
+      }))
+      .filter(m => m.score >= (parseFloat(minScore) || CONFIG.semanticSearchMinScore))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, parseInt(limit) || 10);
+    
+    // Format scores
+    const results = scored.map(m => ({
+      ...m,
+      score: parseFloat(m.score.toFixed(4))
+    }));
+    
+    res.json({ results, count: results.length, searchType: 'semantic' });
+    
+  } catch (err) {
+    console.error('[engram] Semantic search error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Embed existing memories (background task)
+app.post('/api/v1/embed-backlog', async (req, res) => {
+  const { limit } = req.body;
+  const batchSize = parseInt(limit) || 50;
+  
+  try {
+    const emb = getEmbeddings();
+    
+    // Get unembedded memories
+    const memories = db.prepare(`
+      SELECT id, content
+      FROM memories
+      WHERE is_embedded = 0 OR is_embedded IS NULL
+      LIMIT ?
+    `).all(batchSize);
+    
+    if (memories.length === 0) {
+      return res.json({ embedded: 0, message: 'All memories are embedded' });
+    }
+    
+    const updateStmt = db.prepare(`
+      UPDATE memories SET embedding = ?, is_embedded = 1 WHERE id = ?
+    `);
+    
+    let count = 0;
+    for (const mem of memories) {
+      const embedding = await emb.embed(mem.content);
+      const buffer = emb.serializeEmbedding(embedding);
+      updateStmt.run(buffer, mem.id);
+      count++;
+    }
+    
+    res.json({ embedded: count, remaining: db.prepare('SELECT COUNT(*) as c FROM memories WHERE is_embedded = 0 OR is_embedded IS NULL').get().c });
+    
+  } catch (err) {
+    console.error('[engram] Embed backlog error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -349,7 +611,7 @@ app.get('/api/v1/agent/:id/memories', (req, res) => {
   const { type, active, limit, offset } = req.query;
   
   try {
-    let sql = 'SELECT * FROM memories WHERE agent_id = ?';
+    let sql = 'SELECT id, agent_id, type, content, priority, created_at, metadata_json, is_embedded FROM memories WHERE agent_id = ?';
     const params = [id];
     
     if (type) {
@@ -395,13 +657,374 @@ app.delete('/api/v1/memory/:id', (req, res) => {
   }
 });
 
+// ============================================
+// PATTERN LEARNING ENDPOINTS (v0.3.0)
+// ============================================
+
+// Lazy load pattern analyzer
+let patternAnalyzer = null;
+const getPatternAnalyzer = () => {
+  if (!patternAnalyzer) {
+    const { PatternAnalyzer } = require('./services/patterns');
+    patternAnalyzer = new PatternAnalyzer(db);
+  }
+  return patternAnalyzer;
+};
+
+// Analyze a session log
+app.post('/api/v1/analyze-session', (req, res) => {
+  const { agent, session_id, events } = req.body;
+  
+  if (!agent || !events || !Array.isArray(events)) {
+    return res.status(400).json({ error: 'agent and events array are required' });
+  }
+  
+  try {
+    const analyzer = getPatternAnalyzer();
+    const result = analyzer.analyzeSession(agent, session_id, events);
+    
+    res.json({
+      analyzed: true,
+      ...result
+    });
+  } catch (err) {
+    console.error('[engram] Analyze session error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Detect deviations for current session
+app.post('/api/v1/detect-deviations', (req, res) => {
+  const { agent, session } = req.body;
+  
+  if (!agent) {
+    return res.status(400).json({ error: 'agent is required' });
+  }
+  
+  try {
+    const analyzer = getPatternAnalyzer();
+    const deviations = analyzer.detectDeviations(agent, session || []);
+    
+    res.json({
+      deviations,
+      count: deviations.length
+    });
+  } catch (err) {
+    console.error('[engram] Detect deviations error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get learned patterns for an agent
+app.get('/api/v1/patterns', (req, res) => {
+  const { agent, type } = req.query;
+  
+  if (!agent) {
+    return res.status(400).json({ error: 'agent is required' });
+  }
+  
+  try {
+    const analyzer = getPatternAnalyzer();
+    const patterns = analyzer.getPatterns(agent, type);
+    
+    res.json({
+      patterns,
+      count: patterns.length
+    });
+  } catch (err) {
+    console.error('[engram] Get patterns error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add a manual pattern
+app.post('/api/v1/patterns', (req, res) => {
+  const { agent, type, pattern, description, confidence } = req.body;
+  
+  if (!agent || !type || !pattern) {
+    return res.status(400).json({ error: 'agent, type, and pattern are required' });
+  }
+  
+  try {
+    const analyzer = getPatternAnalyzer();
+    const id = analyzer.addPattern(agent, type, pattern, description, confidence);
+    
+    res.json({ id, stored: true });
+  } catch (err) {
+    console.error('[engram] Add pattern error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get pending auto-corrections (repeated mistakes not yet promoted)
+app.get('/api/v1/auto-corrections', (req, res) => {
+  const { agent } = req.query;
+  
+  if (!agent) {
+    return res.status(400).json({ error: 'agent is required' });
+  }
+  
+  try {
+    const analyzer = getPatternAnalyzer();
+    const pending = analyzer.getPendingAutoCorrections(agent);
+    
+    res.json({
+      autoCorrections: pending,
+      count: pending.length
+    });
+  } catch (err) {
+    console.error('[engram] Get auto-corrections error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get recent deviations
+app.get('/api/v1/deviations', (req, res) => {
+  const { agent, hours } = req.query;
+  
+  if (!agent) {
+    return res.status(400).json({ error: 'agent is required' });
+  }
+  
+  try {
+    const analyzer = getPatternAnalyzer();
+    const deviations = analyzer.getRecentDeviations(agent, parseInt(hours) || 24);
+    
+    res.json({
+      deviations,
+      count: deviations.length
+    });
+  } catch (err) {
+    console.error('[engram] Get deviations error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get pattern learning statistics
+app.get('/api/v1/pattern-stats', (req, res) => {
+  const { agent } = req.query;
+  
+  try {
+    const analyzer = getPatternAnalyzer();
+    const stats = analyzer.getStats(agent);
+    
+    res.json(stats);
+  } catch (err) {
+    console.error('[engram] Pattern stats error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Ingest daily memory file for pattern analysis
+app.post('/api/v1/ingest-memory', (req, res) => {
+  const { agent, content, date } = req.body;
+  
+  if (!agent || !content) {
+    return res.status(400).json({ error: 'agent and content are required' });
+  }
+  
+  try {
+    const { SessionLogParser } = require('./services/patterns');
+    const events = SessionLogParser.parseDailyMemory(content);
+    
+    const analyzer = getPatternAnalyzer();
+    const result = analyzer.analyzeSession(agent, `memory-${date || 'unknown'}`, events);
+    
+    res.json({
+      ingested: true,
+      eventsExtracted: events.length,
+      ...result
+    });
+  } catch (err) {
+    console.error('[engram] Ingest memory error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// HIVE-MIND ENDPOINTS (v0.4.0)
+// ============================================
+
+// Lazy load hive-mind service
+let hiveMindService = null;
+const getHiveMind = () => {
+  if (!hiveMindService) {
+    const { HiveMindService } = require('./services/hivemind');
+    hiveMindService = new HiveMindService(db);
+  }
+  return hiveMindService;
+};
+
+// Share knowledge to the hive
+app.post('/api/v1/hive/share', (req, res) => {
+  const { agent, type, content, priority, topics, targets, immediate } = req.body;
+  
+  if (!agent || !type || !content) {
+    return res.status(400).json({ error: 'agent, type, and content are required' });
+  }
+  
+  try {
+    const hive = getHiveMind();
+    const result = hive.share(agent, type, content, {
+      priority,
+      topics: topics || [],
+      targetAgents: targets,
+      immediate: immediate || false
+    });
+    
+    res.json(result);
+  } catch (err) {
+    console.error('[engram] Hive share error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Broadcast a correction fleet-wide
+app.post('/api/v1/hive/broadcast-correction', (req, res) => {
+  const { agent, original, corrected, reason } = req.body;
+  
+  if (!agent || !original || !corrected) {
+    return res.status(400).json({ error: 'agent, original, and corrected are required' });
+  }
+  
+  try {
+    const hive = getHiveMind();
+    const result = hive.broadcastCorrection(agent, original, corrected, reason || 'No reason given');
+    
+    res.json(result);
+  } catch (err) {
+    console.error('[engram] Broadcast correction error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Process pending propagations
+app.post('/api/v1/hive/propagate', (req, res) => {
+  try {
+    const hive = getHiveMind();
+    const result = hive.processPendingPropagations();
+    
+    res.json(result);
+  } catch (err) {
+    console.error('[engram] Propagate error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get knowledge for an agent (including hive knowledge)
+app.get('/api/v1/hive/knowledge', (req, res) => {
+  const { agent, type, limit, includeHive } = req.query;
+  
+  if (!agent) {
+    return res.status(400).json({ error: 'agent is required' });
+  }
+  
+  try {
+    const hive = getHiveMind();
+    const knowledge = hive.getKnowledgeForAgent(agent, {
+      type,
+      limit: parseInt(limit) || 20,
+      includeHive: includeHive !== 'false'
+    });
+    
+    res.json({
+      knowledge,
+      count: knowledge.length
+    });
+  } catch (err) {
+    console.error('[engram] Get knowledge error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Subscribe to a topic
+app.post('/api/v1/hive/subscribe', (req, res) => {
+  const { agent, topic, priorityThreshold } = req.body;
+  
+  if (!agent || !topic) {
+    return res.status(400).json({ error: 'agent and topic are required' });
+  }
+  
+  try {
+    const hive = getHiveMind();
+    const result = hive.subscribe(agent, topic, priorityThreshold);
+    
+    res.json(result);
+  } catch (err) {
+    console.error('[engram] Subscribe error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get agent subscriptions
+app.get('/api/v1/hive/subscriptions', (req, res) => {
+  const { agent } = req.query;
+  
+  if (!agent) {
+    return res.status(400).json({ error: 'agent is required' });
+  }
+  
+  try {
+    const hive = getHiveMind();
+    const subscriptions = hive.getSubscriptions(agent);
+    
+    res.json({
+      subscriptions,
+      count: subscriptions.length
+    });
+  } catch (err) {
+    console.error('[engram] Get subscriptions error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get recent propagations
+app.get('/api/v1/hive/propagations', (req, res) => {
+  const { limit } = req.query;
+  
+  try {
+    const hive = getHiveMind();
+    const propagations = hive.getRecentPropagations(parseInt(limit) || 10);
+    
+    res.json({
+      propagations,
+      count: propagations.length
+    });
+  } catch (err) {
+    console.error('[engram] Get propagations error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get hive stats
+app.get('/api/v1/hive/stats', (req, res) => {
+  try {
+    const hive = getHiveMind();
+    const stats = hive.getStats();
+    
+    res.json(stats);
+  } catch (err) {
+    console.error('[engram] Hive stats error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Start server
 const startServer = () => {
   initDatabase();
   
+  // Preload embedding model in background
+  console.log('[engram] Preloading embedding model...');
+  getEmbeddings().embed('warmup').then(() => {
+    console.log('[engram] Embedding model ready');
+  }).catch(err => {
+    console.error('[engram] Failed to load embedding model:', err);
+  });
+  
   app.listen(CONFIG.port, '127.0.0.1', () => {
     console.log(`[engram] Server running on http://127.0.0.1:${CONFIG.port}`);
     console.log(`[engram] Database: ${CONFIG.dbPath}`);
+    console.log(`[engram] Semantic search: enabled`);
   });
 };
 

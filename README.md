@@ -1,9 +1,9 @@
 # Engram: Persistent Memory Architecture for Autonomous Agents
 
-**Version:** 0.1.0  
+**Version:** 0.4.0  
 **Author:** Kevin (Hand of the King)  
 **Date:** 2026-03-12  
-**Status:** Design Phase
+**Status:** Production (Running)
 
 ---
 
@@ -161,23 +161,45 @@ The persistent Node.js service that maintains all memory state.
 Lightweight command-line client for agent interaction.
 
 ```bash
-# Context injection (run on session start)
-engram wake --agent kevin
+# === SESSION START ===
+engram wake                          # Get context injection for session start
 
-# Store a memory
-engram remember --type task --priority high "Deploy CryptoBot to staging"
+# === MEMORY STORAGE ===
+engram remember "Important fact"     # Store a memory (auto-deduplicates)
+engram decide "Choice" --reason "Why"  # Record a decision with rationale
 
-# Store a decision
-engram decide "Using SQLite over Postgres" --reason "Single-node, simplicity > scale"
+# === CORRECTIONS ===
+engram correct                       # Log a behavioral correction
 
-# Query memories
-engram recall "what was the decision about databases"
+# === SEARCH ===
+engram recall "query"                # Keyword/FTS search
+engram search "query"                # Semantic vector similarity search
 
-# Log a correction (user feedback)
-engram correct "Don't use web_fetch for internal docs"
+# === PATTERN LEARNING ===
+engram patterns                      # List learned behavioral patterns
+engram deviations                    # See recent deviations from patterns
+engram auto-corrections              # Pending auto-generated corrections
+engram learn "Description"           # Manually add a pattern
+engram analyze <file>                # Analyze session/memory for patterns
+engram ingest <file>                 # Ingest daily memory markdown
 
-# Check brain status
-engram status
+# === CROSS-AGENT KNOWLEDGE (HIVE-MIND) ===
+engram share "Knowledge"             # Share with other agents
+engram broadcast "wrong" "right"     # Fleet-wide correction
+engram propagate                     # Process pending propagations
+engram hive-knowledge                # Get knowledge from hive
+engram propagations                  # View recent propagations
+engram subscribe <topic>             # Subscribe to knowledge topic
+engram subscriptions                 # List your subscriptions
+engram hive-stats                    # Hive-mind statistics
+
+# === TOOL TRACKING ===
+engram tool-used <tool>              # Log tool usage (tracks forgotten tools)
+
+# === MAINTENANCE ===
+engram status                        # Check service status
+engram embed-backlog                 # Embed memories lacking vectors
+engram init                          # Initialize database (first run)
 ```
 
 ### 3. Session Manager
@@ -371,7 +393,7 @@ When an agent wakes up, Engram returns a structured injection:
 
 ```markdown
 ## 🧠 Engram Context Injection
-*Last sync: 2026-03-12T18:46:00Z | Memories: 47 | Patterns: 12*
+*Last sync: 2026-03-12T18:46:00Z | Memories: 31 | Patterns: 3*
 
 ### Active Tasks (3)
 1. [HIGH] Deploy CryptoBot to staging — blocked on API keys
@@ -382,18 +404,28 @@ When an agent wakes up, Engram returns a structured injection:
 - **System crons > Gateway crons** — Gateway crons unreliable (2026-03-12)
 - **SQLite for Engram** — Single-node, simplicity over scale (2026-03-12)
 
-### Active Corrections
+### Active Corrections (6 pending)
 ⚠️ Don't use web_fetch for internal docs — use scroll-keeper or local files
 ⚠️ Always add attendees to calendar events
 
-### Pattern Drift Warnings
-🔴 kt toolkit usage: 0% in last 3 sessions (expected: daily)
-🟡 Memory consolidation: 7 days overdue
+### Learned Patterns
+- [session_start] Run engram wake at session start (100% confidence)
+- [tool_frequency] Check fleet status daily (80% confidence)
 
-### Tools You Keep Forgetting
-- `kt sync` — Run at session start
-- `kt learn` — Log learnings for cross-agent sharing
-- `brain status` — Quick state check (HEARTBEAT.md shortcut)
+### Hive-Mind Knowledge
+📡 Recent propagations from other agents available via `engram hive-knowledge`
+```
+
+### Status Output
+
+```
+$ engram status
+Engram v0.4.0 | Status: RUNNING
+Agents: 11 | Memories: 31 | Embedded: 1
+Patterns: 3 | Pending Corrections: 6 | Deviations: 0
+Semantic Search: ✓ | Pattern Learning: ✓
+Uptime: 251 minutes
+Database: /var/lib/engram/brain.db
 ```
 
 ---
@@ -574,24 +606,36 @@ Recommendation: Start with Option A, add sync later if needed.
 
 ---
 
-## Future Work
+## Implementation Status
 
-### Phase 2: Semantic Search
-- Embed memories using local model (e.g., `all-MiniLM-L6-v2`)
-- Vector similarity search for better recall
+### ✅ Phase 1: Core Memory (Complete)
+- SQLite-backed persistent storage
+- Memory types: task, decision, fact, preference, correction, pattern, context
+- FTS5 full-text search
+- CLI interface (`engram` binary)
+- Systemd service
+
+### ✅ Phase 2: Semantic Search (Complete)
+- Local embeddings via `all-MiniLM-L6-v2` (384-dimensional vectors)
+- Vector similarity search (`engram search`)
 - Automatic deduplication of similar memories
+- Embedding backlog processing (`engram embed-backlog`)
 
-### Phase 3: Pattern Learning
-- Analyze session logs for behavioral patterns
-- Detect when agent deviates from established patterns
-- Auto-generate corrections from repeated mistakes
+### ✅ Phase 3: Pattern Learning (Complete)
+- Behavioral pattern detection from session history
+- Deviation tracking when agent strays from patterns
+- Auto-generated corrections from repeated mistakes
+- Pattern confidence scoring
+- Commands: `engram patterns`, `engram deviations`, `engram auto-corrections`
 
-### Phase 4: Cross-Agent Knowledge
-- Shared memory pool for all agents
-- Learning propagation (one agent learns, all benefit)
-- Conflict resolution for contradictory memories
+### ✅ Phase 4: Cross-Agent Knowledge (Complete)
+- Hive-mind knowledge propagation
+- Agent specialization routing (11 agents with defined expertise)
+- Fleet-wide correction broadcasting
+- Topic-based subscriptions
+- Commands: `engram share`, `engram broadcast`, `engram hive-knowledge`, `engram propagate`
 
-### Phase 5: External Integration
+### 🔄 Phase 5: External Integration (Planned)
 - Webhook notifications on important events
 - Export/import for backup and migration
 - Web dashboard for memory inspection
@@ -605,36 +649,20 @@ engram/
 ├── README.md                 # This file
 ├── package.json
 ├── src/
-│   ├── server.js            # Main daemon
-│   ├── cli.js               # CLI client
-│   ├── db/
-│   │   ├── schema.sql       # Database schema
-│   │   ├── migrations/      # Schema migrations
-│   │   └── connection.js    # SQLite wrapper
-│   ├── api/
-│   │   ├── routes.js        # REST endpoints
-│   │   └── socket.js        # Unix socket handler
-│   ├── services/
-│   │   ├── memory.js        # Memory CRUD
-│   │   ├── session.js       # Session tracking
-│   │   ├── injection.js     # Context generation
-│   │   └── patterns.js      # Pattern analysis
-│   └── utils/
-│       ├── logger.js
-│       └── config.js
+│   ├── server.js            # Main daemon (HTTP + Unix socket)
+│   ├── cli.js               # CLI client (all commands)
+│   └── services/
+│       ├── embeddings.js    # Semantic embeddings (MiniLM-L6-v2)
+│       ├── hivemind.js      # Cross-agent knowledge propagation
+│       └── patterns.js      # Pattern learning & deviation detection
 ├── schemas/
 │   └── schema.sql           # Database schema (reference)
 ├── scripts/
-│   ├── install.sh           # Installation script
-│   └── migrate.sh           # Migration runner
+│   └── install.sh           # Installation script
 ├── tests/
-│   ├── memory.test.js
-│   ├── injection.test.js
-│   └── api.test.js
+│   └── *.test.js            # Test files
 ├── docs/
-│   ├── api.md               # API reference
-│   ├── integration.md       # Integration guide
-│   └── troubleshooting.md
+│   └── *.md                 # Documentation
 └── systemd/
     └── engram.service       # Systemd unit file
 ```
@@ -647,21 +675,30 @@ engram/
 # 1. Clone and install
 cd /srv/openclaw-shared/engram
 npm install
+sudo npm link  # Makes 'engram' CLI available globally
 
 # 2. Initialize database
-./scripts/install.sh
+engram init
 
 # 3. Start service
+sudo systemctl enable engram
 sudo systemctl start engram
 
 # 4. Test it
 engram status
-engram remember --type fact "Engram is now operational"
+engram remember "Engram is now operational"
 engram recall "engram"
+engram search "operational"  # Semantic search
 
-# 5. Integrate with Kevin
-# Add to HEARTBEAT.md:
-# engram wake --agent kevin
+# 5. Use in your session
+engram wake                  # Get context injection on session start
+engram decide "Choice" --reason "Why"
+engram correct               # Log a correction
+
+# 6. Cross-agent knowledge
+engram share "Useful discovery"
+engram broadcast "wrong" "right"  # Fleet-wide correction
+engram hive-knowledge        # See what others have shared
 ```
 
 ---
