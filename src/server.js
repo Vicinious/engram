@@ -87,9 +87,14 @@ app.get('/health', (req, res) => {
 
 // Status endpoint
 app.get('/api/v1/status', (req, res) => {
+  const { channel } = req.query;
   const agents = db.prepare('SELECT COUNT(*) as count FROM agents WHERE is_active = 1').get();
-  const memories = db.prepare('SELECT COUNT(*) as count FROM memories WHERE is_active = 1').get();
-  const embedded = db.prepare('SELECT COUNT(*) as count FROM memories WHERE is_embedded = 1').get();
+  const memories = channel
+    ? db.prepare(`SELECT COUNT(*) as count FROM memories WHERE is_active = 1 AND (channel = ? OR channel IS NULL)`).get(channel)
+    : db.prepare('SELECT COUNT(*) as count FROM memories WHERE is_active = 1').get();
+  const embedded = channel
+    ? db.prepare(`SELECT COUNT(*) as count FROM memories WHERE is_embedded = 1 AND is_active = 1 AND (channel = ? OR channel IS NULL)`).get(channel)
+    : db.prepare('SELECT COUNT(*) as count FROM memories WHERE is_embedded = 1').get();
   const sessions = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE state = ?').get('active');
   
   // Pattern stats (may fail if tables don't exist yet)
@@ -122,6 +127,7 @@ app.get('/api/v1/status', (req, res) => {
     unresolvedDeviations: patternStats.unresolvedDeviations,
     pendingPropagations: hiveStats.pendingPropagations,
     hiveMemories: hiveStats.hiveMemories,
+    channel: channel || null,
     dbPath: CONFIG.dbPath,
     uptime: process.uptime(),
     semanticSearch: true,
@@ -431,7 +437,7 @@ app.post('/api/v1/correct', (req, res) => {
 
 // Recall endpoint - FTS search (fallback)
 app.get('/api/v1/recall', (req, res) => {
-  const { q, agent, type, limit } = req.query;
+  const { q, agent, type, limit, channel } = req.query;
   
   if (!q) {
     return res.status(400).json({ error: 'query (q) is required' });
@@ -456,6 +462,11 @@ app.get('/api/v1/recall', (req, res) => {
     if (type) {
       sql += ' AND m.type = ?';
       params.push(type);
+    }
+
+    if (channel) {
+      sql += ' AND (m.channel = ? OR m.channel IS NULL)';
+      params.push(channel);
     }
     
     sql += ` ORDER BY rank LIMIT ?`;

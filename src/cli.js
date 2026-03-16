@@ -13,6 +13,20 @@ const http = require('http');
 
 const BASE_URL = process.env.ENGRAM_URL || 'http://127.0.0.1:18850';
 
+function detectChannel() {
+  const label = process.env.OPENCLAW_CONVERSATION_LABEL;
+  if (label) {
+    const match = label.match(/channel id:(\d+)/);
+    if (match) return `discord:${match[1]}`;
+  }
+
+  if (process.env.ENGRAM_CHANNEL) {
+    return process.env.ENGRAM_CHANNEL;
+  }
+
+  return null;
+}
+
 // HTTP request helper
 const request = (method, path, data = null) => {
   return new Promise((resolve, reject) => {
@@ -94,9 +108,11 @@ program
   .option('-p, --priority <n>', 'Priority 1-10', '5')
   .option('--tags <tags>', 'Comma-separated tags')
   .option('--expires <seconds>', 'Expire after N seconds')
+  .option('--channel <channel>', 'Channel context (e.g., discord:1467909068189335552)')
   .option('--force', 'Skip deduplication check')
   .action(async (content, options) => {
     try {
+      const channel = options.channel || detectChannel() || 'default';
       const result = await request('POST', '/api/v1/remember', {
         agent: options.agent,
         type: options.type,
@@ -104,6 +120,7 @@ program
         priority: parseInt(options.priority),
         tags: options.tags ? options.tags.split(',') : null,
         expires_in: options.expires,
+        channel,
         skipDedupe: options.force
       });
       
@@ -131,12 +148,15 @@ program
   .description('Record a decision (auto-deduplicates)')
   .option('-a, --agent <name>', 'Agent name', process.env.ENGRAM_AGENT || 'kevin')
   .option('-r, --reason <reason>', 'Reason for decision')
+  .option('--channel <channel>', 'Channel context (e.g., discord:1467909068189335552)')
   .action(async (decision, options) => {
     try {
+      const channel = options.channel || detectChannel() || 'default';
       const result = await request('POST', '/api/v1/decide', {
         agent: options.agent,
         decision,
-        reason: options.reason
+        reason: options.reason,
+        channel
       });
       
       if (result.error) {
@@ -164,14 +184,17 @@ program
   .requiredOption('-c, --corrected <behavior>', 'Corrected behavior')
   .option('-r, --reason <reason>', 'Reason for correction')
   .option('-s, --severity <level>', 'Severity (low, medium, high, critical)', 'medium')
+  .option('--channel <channel>', 'Channel context (e.g., discord:1467909068189335552)')
   .action(async (options) => {
     try {
+      const channel = options.channel || detectChannel() || 'default';
       const result = await request('POST', '/api/v1/correct', {
         agent: options.agent,
         original: options.original,
         corrected: options.corrected,
         reason: options.reason,
-        severity: options.severity
+        severity: options.severity,
+        channel
       });
       
       if (result.error) {
@@ -193,6 +216,7 @@ program
   .option('-a, --agent <name>', 'Filter by agent')
   .option('-t, --type <type>', 'Filter by type')
   .option('-l, --limit <n>', 'Max results', '10')
+  .option('--channel <channel>', 'Filter to specific channel')
   .action(async (query, options) => {
     try {
       const params = new URLSearchParams({
@@ -201,6 +225,7 @@ program
       });
       if (options.agent) params.set('agent', options.agent);
       if (options.type) params.set('type', options.type);
+      if (options.channel) params.set('channel', options.channel);
       
       const result = await request('GET', `/api/v1/recall?${params}`);
       
@@ -304,11 +329,14 @@ program
   .command('tool-used <tool>')
   .description('Log that a tool was used (for tracking forgotten tools)')
   .option('-a, --agent <name>', 'Agent name', process.env.ENGRAM_AGENT || 'kevin')
+  .option('--channel <channel>', 'Channel context (e.g., discord:1467909068189335552)')
   .action(async (tool, options) => {
     try {
+      const channel = options.channel || detectChannel() || 'default';
       const result = await request('POST', '/api/v1/tool-used', {
         agent: options.agent,
-        tool
+        tool,
+        channel
       });
       
       if (result.error) {
@@ -327,9 +355,13 @@ program
 program
   .command('status')
   .description('Check Engram service status')
-  .action(async () => {
+  .option('--channel <channel>', 'Filter status to specific channel context')
+  .action(async (options) => {
     try {
-      const result = await request('GET', '/api/v1/status');
+      const params = new URLSearchParams();
+      if (options.channel) params.set('channel', options.channel);
+      const path = params.toString() ? `/api/v1/status?${params}` : '/api/v1/status';
+      const result = await request('GET', path);
       
       if (result.error) {
         console.error('Error:', result.error);
