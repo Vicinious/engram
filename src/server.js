@@ -309,7 +309,7 @@ async function findDuplicates(content, agentId, type) {
 
 // Remember endpoint - store a memory with embedding
 app.post('/api/v1/remember', async (req, res) => {
-  const { agent, type, content, priority, metadata, tags, expires_in, skipDedupe } = req.body;
+  const { agent, type, content, priority, metadata, tags, expires_in, skipDedupe, channel } = req.body;
   
   if (!agent || !type || !content) {
     return res.status(400).json({ error: 'agent, type, and content are required' });
@@ -343,8 +343,8 @@ app.post('/api/v1/remember', async (req, res) => {
     }
     
     const stmt = db.prepare(`
-      INSERT INTO memories (agent_id, type, content, priority, metadata_json, tags, expires_at, embedding, is_embedded)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+      INSERT INTO memories (agent_id, type, content, priority, metadata_json, tags, expires_at, embedding, is_embedded, channel)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     `);
     
     const result = stmt.run(
@@ -355,7 +355,8 @@ app.post('/api/v1/remember', async (req, res) => {
       metadata ? JSON.stringify(metadata) : null,
       tags ? JSON.stringify(tags) : null,
       expiresAt,
-      embeddingBuffer
+      embeddingBuffer,
+      channel || 'default'
     );
     
     res.json({ id: result.lastInsertRowid, stored: true, embedded: true });
@@ -368,7 +369,7 @@ app.post('/api/v1/remember', async (req, res) => {
 
 // Decide endpoint - record a decision with embedding
 app.post('/api/v1/decide', async (req, res) => {
-  const { agent, decision, reason, alternatives } = req.body;
+  const { agent, decision, reason, alternatives, channel } = req.body;
   
   if (!agent || !decision) {
     return res.status(400).json({ error: 'agent and decision are required' });
@@ -392,15 +393,16 @@ app.post('/api/v1/decide', async (req, res) => {
     const embeddingBuffer = emb.serializeEmbedding(embedding);
     
     const stmt = db.prepare(`
-      INSERT INTO memories (agent_id, type, content, priority, metadata_json, embedding, is_embedded)
-      VALUES (?, 'decision', ?, 8, ?, ?, 1)
+      INSERT INTO memories (agent_id, type, content, priority, metadata_json, embedding, is_embedded, channel)
+      VALUES (?, 'decision', ?, 8, ?, ?, 1, ?)
     `);
     
     const result = stmt.run(
       agent,
       decision,
       JSON.stringify({ reason, alternatives }),
-      embeddingBuffer
+      embeddingBuffer,
+      channel || 'default'
     );
     
     res.json({ id: result.lastInsertRowid, stored: true, embedded: true });
